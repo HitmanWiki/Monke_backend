@@ -23,7 +23,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 class AIMatchAgent {
   constructor({ geminiApiKey }) {
     this.genAI = new GoogleGenerativeAI(geminiApiKey);
-    this.model = "gemini-2.0-flash-exp";
+    this.model = "gemini-2.5-flash-exp";
   }
 
   // ══════════════════════════════════════════════════════════════════════
