@@ -10,23 +10,10 @@ const cors    = require("cors");
 const axios   = require("axios");
 const { Pool } = require("pg");
 const AIMatchAgent = require("./ai-match-agent.js");
-const solanaWeb3 = require('@solana/web3.js');
-const { Connection, Keypair, Transaction, sendAndConfirmTransaction, PublicKey } = solanaWeb3;
-const BpfLoader = solanaWeb3.BpfLoader;
-const BPF_LOADER_PROGRAM_ID = solanaWeb3.BPF_LOADER_PROGRAM_ID;
-const fs = require('fs');
-const path = require('path');
-const multer = require('multer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-
-// Configure multer for file uploads
-const upload = multer({ 
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB max
-});
 
 // ─── Env ─────────────────────────────────────────────────────────────────────
 const GEMINI_API_KEY      = process.env.GEMINI_API_KEY;
@@ -551,10 +538,7 @@ app.get("/", (req, res) => res.json({
     resultInput: "POST /api/matches/:id/result",
     refresh: "POST /api/refresh",
     fetchResults: "POST /api/fetch-results",
-    health: "GET /api/health",
-    uploadProgram: "POST /api/upload-program",
-    deploy: "POST /api/deploy",
-    initialize: "POST /api/initialize"
+    health: "GET /api/health"
   }
 }));
 
@@ -813,177 +797,6 @@ app.post("/api/fetch-results", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
-  }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-//  SOLANA DEPLOYMENT ROUTES
-// ═══════════════════════════════════════════════════════════════════
-
-// Upload compiled .so file
-app.post('/api/upload-program', upload.single('program'), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded. Send as "program" field.' });
-    }
-    
-    const programsDir = path.join('/tmp', 'programs');
-    if (!fs.existsSync(programsDir)) {
-      fs.mkdirSync(programsDir, { recursive: true });
-    }
-    
-    const targetPath = path.join(programsDir, 'worldcup_betting.so');
-    fs.writeFileSync(targetPath, req.file.buffer);
-    
-    console.log('✅ Program saved:', targetPath);
-    console.log('📦 Size:', req.file.size, 'bytes');
-    
-    res.json({
-      success: true,
-      message: 'Program uploaded successfully',
-      size: req.file.size,
-      ready: true
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Deploy program to Solana
-app.post('/api/deploy', async (req, res) => {
-  try {
-    const { network = 'devnet' } = req.body;
-    
-    console.log('🚀 Deploying to:', network);
-    
-    const RPC_URLS = {
-      devnet: 'https://api.devnet.solana.com',
-      mainnet: process.env.RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=9e676d35-b97a-4f46-b454-a41e9b7c28be'
-    };
-    
-    const connection = new Connection(RPC_URLS[network], 'confirmed');
-    
-    const privateKeyStr = process.env.ADMIN_PRIVATE_KEY;
-    if (!privateKeyStr || privateKeyStr === 'your_admin_private_key (optional)') {
-      return res.status(400).json({ error: 'ADMIN_PRIVATE_KEY not set in environment variables' });
-    }
-    
-    const deployerKeypair = Keypair.fromSecretKey(new Uint8Array(JSON.parse(privateKeyStr)));
-    console.log('👤 Deployer:', deployerKeypair.publicKey.toString());
-    
-    const balance = await connection.getBalance(deployerKeypair.publicKey);
-    console.log('💰 Balance:', (balance / 1e9).toFixed(4), 'SOL');
-    
-    const possiblePaths = [
-      path.join(process.cwd(), 'programs', 'worldcup_betting.so'),
-      path.join('/tmp', 'programs', 'worldcup_betting.so'),
-    ];
-    
-    let programPath = null;
-    for (const p of possiblePaths) {
-      if (fs.existsSync(p)) { programPath = p; break; }
-    }
-    
-    if (!programPath) {
-      return res.status(400).json({ error: 'No program file found. Upload first via POST /api/upload-program' });
-    }
-    
-    const programData = fs.readFileSync(programPath);
-    console.log('📦 Size:', programData.length, 'bytes');
-    
-    const deployCost = await connection.getMinimumBalanceForRentExemption(programData.length);
-    console.log('💲 Cost:', (deployCost / 1e9).toFixed(4), 'SOL');
-    
-    if (balance < deployCost + 5000000) {
-      return res.status(400).json({
-        error: `Insufficient balance. Need ${((deployCost + 5000000) / 1e9).toFixed(4)} SOL`,
-        currentBalance: (balance / 1e9).toFixed(4) + ' SOL'
-      });
-    }
-    
-    const programKeypair = Keypair.generate();
-    const programId = programKeypair.publicKey;
-    
-    console.log('📋 Program ID:', programId.toString());
-    
-    const tx = new Transaction().add(
-      ...BpfLoader.load({ connection, payer: deployerKeypair, programId: programKeypair, elfBytes: programData })
-    );
-    
-    const signature = await sendAndConfirmTransaction(connection, tx, [deployerKeypair, programKeypair], { commitment: 'confirmed' });
-    
-    console.log('✅ Deployed!');
-    
-    res.json({
-      success: true,
-      programId: programId.toString(),
-      signature: signature,
-      network: network,
-      solscan: `https://solscan.io/account/${programId.toString()}?cluster=${network}`,
-      deployer: deployerKeypair.publicKey.toString(),
-      nextStep: 'POST /api/initialize with { "programId": "' + programId.toString() + '" }',
-      envUpdate: 'PROGRAM_ID=' + programId.toString()
-    });
-    
-  } catch (error) {
-    console.error('❌ Deploy error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get PDA addresses for deployed program
-app.post('/api/initialize', async (req, res) => {
-  try {
-    const { programId, network = 'devnet' } = req.body;
-    
-    if (!programId) {
-      return res.status(400).json({ error: 'programId is required' });
-    }
-    
-    console.log('⚙️ Calculating PDAs for:', programId);
-    
-    const PROGRAM_ID = new PublicKey(programId);
-    const TOKEN_MINT_KEY = new PublicKey(process.env.TOKEN_MINT || 'BZP9h9kBEnrBV1N6kmqTbfrJx262Qzre2Mg1NrBHpump');
-    
-    const [adminConfigPda] = PublicKey.findProgramAddressSync([Buffer.from("admin_config")], PROGRAM_ID);
-    const [oracleConfigPda] = PublicKey.findProgramAddressSync([Buffer.from("oracle_config")], PROGRAM_ID);
-    const [vaultPda] = PublicKey.findProgramAddressSync([Buffer.from("vault")], PROGRAM_ID);
-    const [ultimatePoolPda] = PublicKey.findProgramAddressSync([Buffer.from("ultimate_pool")], PROGRAM_ID);
-    
-    const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
-    const TOKEN_PROGRAM_ID_KEY = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-    
-    const [vaultTokenAccount] = PublicKey.findProgramAddressSync(
-      [vaultPda.toBuffer(), TOKEN_PROGRAM_ID_KEY.toBuffer(), TOKEN_MINT_KEY.toBuffer()],
-      ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-    
-    console.log('✅ PDAs calculated');
-    
-    res.json({
-      success: true,
-      programId: programId,
-      network: network,
-      accounts: {
-        adminConfig: adminConfigPda.toString(),
-        oracleConfig: oracleConfigPda.toString(),
-        vault: vaultPda.toString(),
-        ultimatePool: ultimatePoolPda.toString(),
-        vaultTokenAccount: vaultTokenAccount.toString(),
-      },
-      tokenMint: TOKEN_MINT_KEY.toString(),
-      config: {
-        platformFee: '2% (200 bps)',
-        oracleFee: '1% (100 bps)',
-        minBet: '1 MONKE (1,000,000 raw)',
-        ultimateDeadline: 'July 19, 2026'
-      }
-    });
-    
-  } catch (error) {
-    console.error('Init error:', error);
-    res.status(500).json({ error: error.message });
   }
 });
 
