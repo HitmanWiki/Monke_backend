@@ -637,17 +637,28 @@ app.post("/api/matches/:id/result", async (req, res) => {
 
 app.get("/api/stats", async (req, res) => {
   try {
-    const [matches, bets, users, volume] = await Promise.all([
+    const [matches, bets, users, matchVolume, ultimateVolume, ultimateBets] = await Promise.all([
       query("SELECT COUNT(*) FROM matches"),
       query("SELECT COUNT(*) FROM bets"),
       query("SELECT COUNT(DISTINCT user_address) FROM bets"),
-      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets")
+      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets"),
+      query("SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM ultimate_bets"),
+      query("SELECT COUNT(*) FROM ultimate_bets")
     ]);
+    
+    const totalVolume = parseFloat(matchVolume.rows[0].total || 0) + 
+                        parseFloat(ultimateVolume.rows[0].total || 0);
+    const totalBets = parseInt(bets.rows[0].count) + parseInt(ultimateBets.rows[0].count);
+    
     res.json({
       matchCount: parseInt(matches.rows[0].count),
-      totalBets: parseInt(bets.rows[0].count),
+      totalBets: totalBets,
+      matchBets: parseInt(bets.rows[0].count),
+      ultimateBets: parseInt(ultimateBets.rows[0].count),
       uniqueUsers: parseInt(users.rows[0].count),
-      totalVolumeMONKE: volume.rows[0].total || 0
+      totalVolumeMONKE: totalVolume,
+      matchVolume: matchVolume.rows[0].total || 0,
+      ultimateVolume: ultimateVolume.rows[0].total || 0
     });
   } catch {
     res.json({ matchCount: 104, totalBets: 0, uniqueUsers: 0, totalVolumeMONKE: 0 });
@@ -656,16 +667,35 @@ app.get("/api/stats", async (req, res) => {
 
 app.get("/api/user/:address/bets", async (req, res) => {
   try {
+    const address = req.params.address.toLowerCase();
+    
     const [matchBets, ultimateBets] = await Promise.all([
-      query(`SELECT b.*, m.home_team, m.away_team, m.winner as match_outcome, m.status as match_status FROM bets b LEFT JOIN matches m ON b.match_id = m.id WHERE b.user_address = $1 ORDER BY b.created_at DESC`, [req.params.address.toLowerCase()]),
-      query("SELECT * FROM ultimate_bets WHERE user_address = $1 ORDER BY created_at DESC", [req.params.address.toLowerCase()])
+      query(
+        `SELECT b.*, m.home_team, m.away_team, m.winner as match_outcome, m.status as match_status 
+         FROM bets b 
+         LEFT JOIN matches m ON b.match_id = m.id 
+         WHERE b.user_address = $1 
+         ORDER BY b.created_at DESC`, 
+        [address]
+      ),
+      query(
+        "SELECT * FROM ultimate_bets WHERE user_address = $1 ORDER BY created_at DESC", 
+        [address]
+      )
     ]);
-    res.json({ matchBets: matchBets.rows, ultimateBets: ultimateBets.rows });
+    
+    console.log('Match bets:', matchBets.rows.length);
+    console.log('Ultimate bets:', ultimateBets.rows.length);
+    
+    res.json({ 
+      matchBets: matchBets.rows, 
+      ultimateBets: ultimateBets.rows 
+    });
   } catch (err) {
+    console.error('User bets error:', err);
     res.status(500).json({ error: err.message });
   }
 });
-
 app.post("/api/bets", async (req, res) => {
   const { matchId, userAddress, prediction, amount, txHash } = req.body;
   if (!matchId || !userAddress || !prediction || !amount) {
