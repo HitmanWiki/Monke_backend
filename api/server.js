@@ -10,7 +10,7 @@ const cors    = require("cors");
 const axios   = require("axios");
 const { Pool } = require("pg");
 const AIMatchAgent = require("./ai-match-agent.js");
-
+const { Connection, PublicKey } = require('@solana/web3.js');
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -24,6 +24,18 @@ const ADMIN_PRIVATE_KEY   = process.env.ADMIN_PRIVATE_KEY || '';
 const TOKEN_MINT          = process.env.TOKEN_MINT || '';
 const PROGRAM_ID          = process.env.PROGRAM_ID || '';
 const RPC_URL             = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
+
+const SYNC_RPC_URL = process.env.RPC_URL || 'https://api.devnet.solana.com';
+const SYNC_PROGRAM_ID = process.env.PROGRAM_ID || '8ZPvMMXMAhDNGroTNHbcGtLYjD5r1Le6iZduuqXiBRCc';
+
+function toLEBytes(num, len) {
+  const buf = Buffer.alloc(len);
+  const big = BigInt(num);
+  for (let i = 0; i < len; i++) {
+    buf[i] = Number((big >> BigInt(i * 8)) & BigInt(0xFFn));
+  }
+  return buf;
+}
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
 if (!DATABASE_URL)   { console.error("DATABASE_URL missing");     process.exit(1); }
@@ -516,7 +528,183 @@ async function runAutomation() {
   try { await autoSettleUltimateOnChain(); } catch (e) { console.error('❌ settleUltimate error:', e.message); }
   console.log('✅ Automation complete');
 }
+// ═══════════════════════════════════════════════════════════════
+//  ON-CHAIN BET SYNC (Runs every 6 hours)
+// ═══════════════════════════════════════════════════════════════
 
+async function syncBetsFromChain() {
+  console.log('🔄 Syncing bets from on-chain...');
+  
+  try {
+    const connection = new Connection(SYNC_RPC_URL, 'confirmed');
+    const programId = new PublicKey(SYNC_PROGRAM_ID);
+    
+    // Get all users who have placed bets
+    const users = await query("SELECT DISTINCT user_address FROM bets UNION SELECT DISTINCT user_address FROM ultimate_bets");
+    
+    let synced = 0;
+    
+    for (const row of users.rows) {
+      const userAddress = row.user_address;
+      const userKey = new PublicKey(userAddress);
+      
+      // === Sync Match Bets ===
+      for (let matchId = 1; matchId <= 104; matchId++) {
+        try {
+          const [counterPda] = PublicKey.findProgramAddressSync(
+            [Buffer.from("user_bet_counter"), userKey.toBuffer(), toLEBytes(matchId, 8)],
+            programId
+          );
+          
+          const counterInfo = await connection.getAccountInfo(counterPda);
+          if (!counterInfo) continue;
+          
+          const totalBets = Number(counterInfo.data.readBigUInt64LE(8));
+          
+          for (let i = 0; i < totalBets; i++) {
+            try {
+              const [betPda] = PublicKey.findProgramAddressSync(
+                [Buffer.from("user_bet"), userKey.toBuffer(), toLEBytes(matchId, 8), toLEBytes(i, 8)],
+                programId
+              );
+              
+              const betInfo = await connection.getAccountInfo(betPda);
+              if (!betInfo || betInfo.data.length < 50) continue;
+              
+              const d = betInfo.data;
+              // Anchor discriminator: 8 bytes
+              // user: 32 bytes (offset 8-39)
+              // match_id: 8 bytes (offset 40-47)
+              // prediction: 1 byte (offset 48)
+              // amount: 8 bytes (offset 49-56)
+              // claimed: 1 byte (offset 57)
+              
+              const prediction = d[48];
+              const amount = Number(d.readBigUInt64LE(49));
+              const claimed = d[57] === 1;
+              
+              const predMap = { 1: 'HOME_WIN', 2: 'DRAW', 3: 'AWAY_WIN' };
+              const predStr = predMap[prediction] || 'HOME_WIN';
+              const amountMONKE = (amount / 1e6).toFixed(2);
+              
+              // Check if already in DB
+              const existing = await query(
+                "SELECT id FROM bets WHERE user_address = $1 AND match_id = $2 AND ABS(CAST(amount AS DECIMAL) - CAST($3 AS DECIMAL)) < 0.01",
+                [userAddress, matchId, amountMONKE]
+              );
+              
+              if (existing.rows.length === 0) {
+                await query(
+                  "INSERT INTO bets (match_id, user_address, prediction, amount, tx_hash, claimed) VALUES ($1, $2, $3, $4, $5, $6)",
+                  [matchId, userAddress, predStr, amountMONKE, 'synced-from-chain', claimed]
+                );
+                synced++;
+                console.log(`✅ Match bet: ${userAddress.slice(0,6)}... Match ${matchId} - ${amountMONKE} MONKE`);
+              }
+            } catch(e) {
+              // Skip individual bet errors
+            }
+          }
+        } catch(e) {
+          // Skip individual match errors
+        }
+      }
+      
+      // === Sync Ultimate Bets ===
+      try {
+        const [ultimateCounterPda] = PublicKey.findProgramAddressSync(
+          [Buffer.from("user_ultimate_counter"), userKey.toBuffer()],
+          programId
+        );
+        
+        const counterInfo = await connection.getAccountInfo(ultimateCounterPda);
+        if (!counterInfo) continue;
+        
+        const totalUltimateBets = Number(counterInfo.data.readBigUInt64LE(8));
+        
+        for (let i = 0; i < totalUltimateBets; i++) {
+          try {
+            const [betPda] = PublicKey.findProgramAddressSync(
+              [Buffer.from("user_ultimate"), userKey.toBuffer(), toLEBytes(i, 8)],
+              programId
+            );
+            
+            const betInfo = await connection.getAccountInfo(betPda);
+            if (!betInfo || betInfo.data.length < 50) continue;
+            
+            const d = betInfo.data;
+            // Anchor discriminator: 8 bytes
+            // user: 32 bytes (offset 8-39)
+            // team: string (offset 40+)
+            //   - length: 4 bytes
+            //   - data: variable
+            // amount: 8 bytes after team
+            // claimed: 1 byte after amount
+            
+            const teamLen = Number(d.readUInt32LE(40));
+            const team = d.slice(44, 44 + teamLen).toString('utf8');
+            const amountOffset = 44 + teamLen;
+            const amount = Number(d.readBigUInt64LE(amountOffset));
+            const claimedOffset = amountOffset + 8;
+            const claimed = d[claimedOffset] === 1;
+            const amountMONKE = (amount / 1e6).toFixed(2);
+            
+            // Check if already in DB
+            const existing = await query(
+              "SELECT id FROM ultimate_bets WHERE user_address = $1 AND team = $2 AND ABS(CAST(amount AS DECIMAL) - CAST($3 AS DECIMAL)) < 0.01",
+              [userAddress, team, amountMONKE]
+            );
+            
+            if (existing.rows.length === 0) {
+              await query(
+                "INSERT INTO ultimate_bets (user_address, team, amount, tx_hash, claimed) VALUES ($1, $2, $3, $4, $5)",
+                [userAddress, team, amountMONKE, 'synced-from-chain', claimed]
+              );
+              synced++;
+              console.log(`✅ Ultimate bet: ${userAddress.slice(0,6)}... ${team} - ${amountMONKE} MONKE`);
+            }
+          } catch(e) {
+            // Skip individual bet errors
+          }
+        }
+      } catch(e) {
+        // Skip user errors
+      }
+    }
+    
+    console.log(`✅ Sync complete: ${synced} new bets synced from chain`);
+    return synced;
+    
+  } catch (error) {
+    console.error('❌ Sync error:', error.message);
+    return 0;
+  }
+}
+
+// Manual sync endpoint
+app.post("/api/sync-bets", async (req, res) => {
+  try {
+    const synced = await syncBetsFromChain();
+    res.json({ success: true, synced });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Auto-sync schedule
+function scheduleBetSync() {
+  // Run every 6 hours
+  setInterval(async () => {
+    try {
+      const synced = await syncBetsFromChain();
+      console.log(`Auto-sync: ${synced} bets synced`);
+    } catch (e) {
+      console.error('Auto-sync error:', e.message);
+    }
+  }, 6 * 60 * 60 * 1000);
+  
+  console.log('⏰ Bet sync scheduled every 6 hours');
+}
 // ════════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ════════════════════════════════════════════════════════════════════════
@@ -871,6 +1059,9 @@ async function start() {
   const adminReady = initAdmin();
   scheduleAutoRefresh();
   scheduleResultFetching();
+  
+  // 🔥 START BET SYNC
+  scheduleBetSync();
 
   if (adminReady) {
     setTimeout(runAutomation, 5000);
@@ -878,12 +1069,24 @@ async function start() {
     console.log("⏰ Solana automation scheduled every 5 minutes");
   }
 
+  // 🔥 Run initial bet sync after 10 seconds
+  setTimeout(async () => {
+    try {
+      console.log('🔄 Running initial bet sync...');
+      const synced = await syncBetsFromChain();
+      console.log(`✅ Initial sync: ${synced} bets synced from chain`);
+    } catch(e) {
+      console.error('❌ Initial sync error:', e.message);
+    }
+  }, 10000);
+
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
     console.log(`\n🚀 MONKE BET Server running on port ${PORT}`);
     console.log(`⚽ Matches : GET /api/matches`);
     console.log(`⚡ Blockchain: Solana`);
     console.log(`🤖 Automation : ${adminReady ? '✅ ENABLED' : '⚠️ DISABLED'}`);
+    console.log(`🔄 Bet Sync : Every 6 hours`);
     console.log(`📅 Ultimate Deadline: July 20, 2026 00:30 UTC`);
     console.log("=".repeat(55));
   });
