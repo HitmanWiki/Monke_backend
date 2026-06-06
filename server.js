@@ -635,7 +635,7 @@ async function processPayouts() {
 //  AUTO-PAYOUT - Runs on Heroku (No PC needed!)
 // ═══════════════════════════════════════════════════════════════
 
-const { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { Connection, Keypair, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } = require('@solana/web3.js');
 const { getAssociatedTokenAddress, createTransferInstruction, TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const bs58 = require('bs58');
 
