@@ -656,20 +656,19 @@ async function sendPayouts() {
       console.error('❌ Could not find token mint account!');
       return;
     }
-    const TOKEN_PROGRAM_ID = mintInfo.owner;
-    const CLASSIC_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
-    const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
-    const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
     
-    console.log('Token program:', TOKEN_PROGRAM_ID.toString());
+    // 🔥 MONKE is Token-2022, so always use Token-2022 for transfers
+    const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
+    const CLASSIC_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+    const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
     
     const secretKey = bs58.decode(ADMIN_PRIVATE_KEY);
     const adminKeypair = Keypair.fromSecretKey(secretKey);
     console.log('Admin wallet:', adminKeypair.publicKey.toString());
     
-    // Get admin ATA
+    // Admin ATA (Token-2022)
     const [adminATA] = PublicKey.findProgramAddressSync(
-      [adminKeypair.publicKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+      [adminKeypair.publicKey.toBuffer(), TOKEN_2022_PROGRAM.toBuffer(), tokenMint.toBuffer()],
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
     
@@ -701,7 +700,7 @@ async function sendPayouts() {
         
         const winnerKey = new PublicKey(payout.user_address);
         
-        // 🔥 FIND EXISTING TOKEN ACCOUNTS
+        // 🔥 FIND EXISTING TOKEN ACCOUNTS - PREFER CLASSIC SPL
         const existingAccounts = await connection.getTokenAccountsByOwner(
           winnerKey,
           { mint: tokenMint }
@@ -709,51 +708,44 @@ async function sendPayouts() {
         
         let winnerATA = null;
         let needCreateATA = false;
-        let useTokenProgram = TOKEN_PROGRAM_ID; // Default
         
         if (existingAccounts.value.length > 0) {
-          // 🔥 PREFER CLASSIC SPL OVER TOKEN-2022
-          console.log(`Found ${existingAccounts.value.length} existing token accounts`);
+          console.log(`Found ${existingAccounts.value.length} existing accounts`);
           
+          // Prefer Classic SPL (Phantom-compatible)
           for (const acc of existingAccounts.value) {
             const accInfo = await connection.getAccountInfo(acc.pubkey);
             if (accInfo && accInfo.owner.equals(CLASSIC_TOKEN_PROGRAM)) {
               winnerATA = acc.pubkey;
-              useTokenProgram = CLASSIC_TOKEN_PROGRAM;
-              console.log('✅ Selected Classic SPL account:', winnerATA.toString());
+              console.log('✅ Using Classic SPL:', winnerATA.toString());
               break;
             }
           }
           
-          // Fallback: Use Token-2022 if no Classic SPL found
+          // Fallback to any existing
           if (!winnerATA) {
             winnerATA = existingAccounts.value[0].pubkey;
-            const accInfo = await connection.getAccountInfo(winnerATA);
-            useTokenProgram = accInfo ? accInfo.owner : TOKEN_PROGRAM_ID;
-            console.log('⚠️ Fallback to existing account:', winnerATA.toString());
+            console.log('⚠️ Fallback to:', winnerATA.toString());
           }
         }
         
-        // No account exists - create Classic SPL ATA
+        // Create Classic SPL ATA if none exists
         if (!winnerATA) {
           [winnerATA] = PublicKey.findProgramAddressSync(
             [winnerKey.toBuffer(), CLASSIC_TOKEN_PROGRAM.toBuffer(), tokenMint.toBuffer()],
             ASSOCIATED_TOKEN_PROGRAM_ID
           );
-          useTokenProgram = CLASSIC_TOKEN_PROGRAM;
           needCreateATA = true;
-          console.log('📝 Creating Classic SPL account:', winnerATA.toString());
+          console.log('📝 Creating Classic SPL:', winnerATA.toString());
         }
         
         const amountRaw = Math.floor(amount * 1e6);
         
-        console.log(`📤 Sending ${amount.toFixed(2)} MONKE to ${payout.user_address.slice(0,8)}...`);
-        console.log(`   Using ATA: ${winnerATA.toString()}`);
-        console.log(`   Token Program: ${useTokenProgram.toString()}`);
+        console.log(`📤 Sending ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
         
         const tx = new Transaction();
         
-        // Create ATA only if needed
+        // Create Classic SPL ATA if needed
         if (needCreateATA) {
           tx.add(new TransactionInstruction({
             keys: [
@@ -770,7 +762,7 @@ async function sendPayouts() {
           }));
         }
         
-        // Build transfer instruction
+        // 🔥 ALWAYS use Token-2022 for transfer (admin's tokens are Token-2022)
         const keys = [
           { pubkey: adminATA, isSigner: false, isWritable: true },
           { pubkey: winnerATA, isSigner: false, isWritable: true },
@@ -781,7 +773,7 @@ async function sendPayouts() {
         data[0] = 3;
         data.writeBigUInt64LE(BigInt(amountRaw), 1);
         
-        tx.add(new TransactionInstruction({ keys, programId: useTokenProgram, data }));
+        tx.add(new TransactionInstruction({ keys, programId: TOKEN_2022_PROGRAM, data }));
         
         const { blockhash } = await connection.getLatestBlockhash();
         tx.recentBlockhash = blockhash;
@@ -801,7 +793,6 @@ async function sendPayouts() {
         
       } catch(e) {
         console.error(`❌ Payout #${payout.id} FAILED:`, e.message);
-        if (e.logs) console.error('Logs:', e.logs);
       }
     }
     
