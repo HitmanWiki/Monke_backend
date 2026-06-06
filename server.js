@@ -859,7 +859,7 @@ app.get("/api/payouts/:address", async (req, res) => {
        LEFT JOIN matches m ON p.match_id = m.id 
        WHERE p.user_address = $1 AND p.type IN ('match', 'refund')
        ORDER BY p.created_at DESC`,
-      [req.params.address.toLowerCase()]
+      [String(req.params.address).trim()]
     );
     res.json({ payouts: payouts.rows });
   } catch (err) {
@@ -998,7 +998,10 @@ app.get("/api/stats", async (req, res) => {
 
 app.get("/api/user/:address/bets", async (req, res) => {
   try {
-    const address = req.params.address.toLowerCase();
+    // 🔥 Don't use toLowerCase() - it corrupts Solana addresses
+    const address = String(req.params.address).trim();
+    
+    console.log('Looking up bets for:', address);
     
     const [matchBets, ultimateBets] = await Promise.all([
       query(
@@ -1029,25 +1032,41 @@ app.get("/api/user/:address/bets", async (req, res) => {
 });
 app.post("/api/bets", async (req, res) => {
   const { matchId, userAddress, prediction, amount, txHash } = req.body;
+  
+  // 🔥 DEBUG
+  console.log('=== BET RECEIVED ===');
+  console.log('Original userAddress:', userAddress);
+  
   if (!matchId || !userAddress || !prediction || !amount) {
     return res.status(400).json({ error: "Missing required fields" });
   }
+  
+  // 🔥 Store the address AS-IS, don't modify it!
+  const cleanAddress = String(userAddress).trim();
+  console.log('Storing address:', cleanAddress);
+  
   try {
     const result = await query(
       "INSERT INTO bets (match_id, user_address, prediction, amount, tx_hash) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-      [matchId, userAddress.toLowerCase(), prediction, amount.toString(), txHash || null]
+      [matchId, cleanAddress, prediction, amount.toString(), txHash || null]
     );
+    console.log('✅ Saved bet #' + result.rows[0].id);
     res.json({ success: true, betId: result.rows[0].id });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
 app.post("/api/ultimate-bets", async (req, res) => {
   const { userAddress, team, amount, txHash } = req.body;
   if (!userAddress || !team || !amount) return res.status(400).json({ error: "Missing required fields" });
+  
+  const cleanAddress = String(userAddress).trim();
+  
   try {
-    await query("INSERT INTO ultimate_bets (user_address, team, amount, tx_hash) VALUES ($1, $2, $3, $4)", [userAddress.toLowerCase(), team, amount.toString(), txHash || null]);
+    await query(
+      "INSERT INTO ultimate_bets (user_address, team, amount, tx_hash) VALUES ($1, $2, $3, $4)", 
+      [cleanAddress, team, amount.toString(), txHash || null]
+    );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
