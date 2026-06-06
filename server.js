@@ -770,6 +770,26 @@ app.get("/api/payouts/:address", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+// Get pool data for all matches (from DB bets)
+app.get("/api/matches/pools", async (req, res) => {
+  try {
+    const pools = await query(`
+      SELECT 
+        match_id,
+        COALESCE(SUM(CASE WHEN prediction = 'HOME_WIN' THEN CAST(amount AS DECIMAL) ELSE 0 END), 0) as home,
+        COALESCE(SUM(CASE WHEN prediction = 'DRAW' THEN CAST(amount AS DECIMAL) ELSE 0 END), 0) as draw,
+        COALESCE(SUM(CASE WHEN prediction = 'AWAY_WIN' THEN CAST(amount AS DECIMAL) ELSE 0 END), 0) as away,
+        COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total
+      FROM bets 
+      GROUP BY match_id
+      ORDER BY match_id
+    `);
+    
+    res.json({ pools: pools.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post("/api/admin/run-automation", async (req, res) => {
   try {
     await runAutomation();
