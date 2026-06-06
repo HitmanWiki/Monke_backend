@@ -22,7 +22,8 @@ const FOOTBALL_DATA_KEY   = process.env.FOOTBALL_DATA_API_KEY;
 const API_FOOTBALL_KEY    = process.env.API_FOOTBALL_KEY;
 const ADMIN_PRIVATE_KEY   = process.env.ADMIN_PRIVATE_KEY || '';
 const TOKEN_MINT          = process.env.TOKEN_MINT || '';
-const PROGRAM_ID          = process.env.PROGRAM_ID || '';
+const ESCROW_WALLET       = process.env.ADMIN_PRIVATE_KEY ? '5cVWDSpcF6WWo6jLNwVmczNtCjWer5BiWp1VgRjzQhdY' : '';
+const PLATFORM_FEE_BPS    = 300; // 3% platform fee
 const RPC_URL             = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 
 if (!GEMINI_API_KEY) { console.error("GEMINI_API_KEY missing");  process.exit(1); }
@@ -49,13 +50,15 @@ let adminWallet = null;
 let solanaProgram = null;
 
 function initAdmin() {
-  if (!ADMIN_PRIVATE_KEY || !PROGRAM_ID) {
-    console.log("⚠️ Admin not configured - Solana automation disabled");
+  if (!ADMIN_PRIVATE_KEY || ADMIN_PRIVATE_KEY === 'your_admin_private_key (optional)') {
+    console.log("⚠️ Admin key not configured - payouts will be manual");
     return false;
   }
   try {
-    console.log(`✅ MONKE BET on Solana - Program ID: ${PROGRAM_ID}`);
+    console.log(`✅ MONKE BET Escrow System Active`);
     console.log(`✅ Token Mint: ${TOKEN_MINT}`);
+    console.log(`✅ Escrow Wallet: ${ESCROW_WALLET}`);
+    console.log(`✅ Platform Fee: ${PLATFORM_FEE_BPS / 100}%`);
     return true;
   } catch (e) {
     console.error("❌ Admin init failed:", e.message);
@@ -86,7 +89,29 @@ async function initDatabase() {
       last_updated     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `);
-  
+  // Add these after the existing CREATE TABLE statements:
+await query(`
+  CREATE TABLE IF NOT EXISTS payouts (
+    id SERIAL PRIMARY KEY,
+    bet_id INTEGER,
+    user_address TEXT NOT NULL,
+    match_id INTEGER,
+    amount TEXT NOT NULL,
+    tx_hash TEXT,
+    type TEXT DEFAULT 'match', -- 'match' or 'ultimate'
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
+
+await query(`
+  CREATE TABLE IF NOT EXISTS platform_fees (
+    id SERIAL PRIMARY KEY,
+    match_id INTEGER,
+    amount TEXT NOT NULL,
+    tx_hash TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`);
   await query(`
     CREATE TABLE IF NOT EXISTS bets (
       id SERIAL PRIMARY KEY,
@@ -496,24 +521,107 @@ function formatMatch(row) {
   };
 }
 
-// ─── Solana Automation (Placeholder - to be implemented with Anchor) ──────────
-async function autoCreateMatchesOnChain() {
-  console.log("⏳ Solana match creation will be implemented with Anchor");
-}
+const PLATFORM_FEE_BPS = 300; // 3% platform fee
 
-async function autoSettleMatchesOnChain() {
-  console.log("⏳ Solana match settlement will be implemented with Anchor");
-}
-
-async function autoSettleUltimateOnChain() {
-  console.log("⏳ Solana ultimate settlement will be implemented with Anchor");
+async function processPayouts() {
+  console.log('💰 Processing payouts...');
+  
+  try {
+    // Get settled matches that haven't been processed
+    const settledMatches = await query(
+      `SELECT m.* FROM matches m 
+       WHERE m.status = 'FINISHED' 
+       AND m.winner IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM payouts p WHERE p.match_id = m.id AND p.type = 'fee'
+       )
+       ORDER BY m.id ASC`
+    );
+    
+    console.log(`📊 Found ${settledMatches.rows.length} matches to process`);
+    
+    for (const match of settledMatches.rows) {
+      try {
+        // Get winning bets for this match
+        const winningBets = await query(
+          "SELECT * FROM bets WHERE match_id = $1 AND prediction = $2 AND claimed = false",
+          [match.id, match.winner]
+        );
+        
+        // Get total pool
+        const totalPoolResult = await query(
+          "SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets WHERE match_id = $1",
+          [match.id]
+        );
+        
+        const totalPool = parseFloat(totalPoolResult.rows[0].total);
+        if (totalPool === 0) {
+          console.log(`Match ${match.id}: No bets, skipping`);
+          continue;
+        }
+        
+        // Calculate fees
+        const platformFee = totalPool * (PLATFORM_FEE_BPS / 10000);
+        const prizePool = totalPool - platformFee;
+        
+        // Record platform fee
+        await query(
+          "INSERT INTO platform_fees (match_id, amount) VALUES ($1, $2)",
+          [match.id, platformFee.toFixed(2)]
+        );
+        
+        // Calculate winning pool total
+        const winningPoolTotal = winningBets.rows.reduce((sum, b) => sum + parseFloat(b.amount), 0);
+        
+        if (winningPoolTotal === 0) {
+          // No winners - refund all
+          const allBets = await query("SELECT * FROM bets WHERE match_id = $1 AND claimed = false", [match.id]);
+          for (const bet of allBets.rows) {
+            await query(
+              "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'refund')",
+              [bet.id, bet.user_address, match.id, bet.amount]
+            );
+            await query("UPDATE bets SET claimed = true WHERE id = $1", [bet.id]);
+          }
+          console.log(`Match ${match.id}: Refunded all bets (no winners)`);
+        } else {
+          // Pay winners proportionally
+          for (const bet of winningBets.rows) {
+            const betAmount = parseFloat(bet.amount);
+            const payout = (betAmount / winningPoolTotal) * prizePool;
+            
+            await query(
+              "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'match')",
+              [bet.id, bet.user_address, match.id, payout.toFixed(2)]
+            );
+            
+            await query("UPDATE bets SET claimed = true WHERE id = $1", [bet.id]);
+            
+            console.log(`✅ ${bet.user_address.slice(0,8)}... wins ${payout.toFixed(2)} MONKE (Match ${match.id})`);
+          }
+        }
+        
+        // Mark match as processed
+        await query(
+          "INSERT INTO payouts (match_id, amount, type) VALUES ($1, $2, 'fee')",
+          [match.id, platformFee.toFixed(2)]
+        );
+        
+        console.log(`✅ Match ${match.id} processed: Pool=${totalPool.toFixed(2)} Fee=${platformFee.toFixed(2)} Prize=${prizePool.toFixed(2)}`);
+        
+      } catch(e) {
+        console.error(`❌ Error processing match ${match.id}:`, e.message);
+      }
+    }
+    
+  } catch(e) {
+    console.error('❌ Payout error:', e.message);
+  }
 }
 
 async function runAutomation() {
-  console.log('🤖 Running MONKE BET automation on Solana...');
-  try { await autoCreateMatchesOnChain(); } catch (e) { console.error('❌ createMatches error:', e.message); }
-  try { await autoSettleMatchesOnChain(); } catch (e) { console.error('❌ settleMatches error:', e.message); }
-  try { await autoSettleUltimateOnChain(); } catch (e) { console.error('❌ settleUltimate error:', e.message); }
+  console.log('🤖 Running MONKE BET automation...');
+  try { await processPayouts(); } catch (e) { console.error('❌ Payout error:', e.message); }
   console.log('✅ Automation complete');
 }
 
@@ -537,6 +645,7 @@ app.get("/", (req, res) => res.json({
     ultimate: "GET /api/ultimate",
     resultInput: "POST /api/matches/:id/result",
     refresh: "POST /api/refresh",
+    payouts: "GET /api/payouts/:address",
     fetchResults: "POST /api/fetch-results",
     health: "GET /api/health"
   }
@@ -554,7 +663,22 @@ app.get("/api/health", async (req, res) => {
     res.json({ status: "ok", matchesInDB: 0, error: err.message }); 
   }
 });
-
+// 🔥 NEW - Payout endpoint
+app.get("/api/payouts/:address", async (req, res) => {
+  try {
+    const payouts = await query(
+      `SELECT p.*, m.home_team, m.away_team 
+       FROM payouts p 
+       LEFT JOIN matches m ON p.match_id = m.id 
+       WHERE p.user_address = $1 AND p.type IN ('match', 'refund')
+       ORDER BY p.created_at DESC`,
+      [req.params.address.toLowerCase()]
+    );
+    res.json({ payouts: payouts.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 app.post("/api/admin/run-automation", async (req, res) => {
   try {
     await runAutomation();
@@ -838,6 +962,11 @@ function scheduleAutoRefresh() {
   }, 6 * 60 * 60 * 1000);
   console.log("⏰ Auto-refresh scheduled every 6 hours");
 }
+// 🔥 NEW - Payout scheduling
+function schedulePayouts() {
+  setInterval(processPayouts, 5 * 60 * 1000);
+  console.log("💰 Payout processing scheduled every 5 minutes");
+}
 
 function scheduleResultFetching() {
   if (!FOOTBALL_DATA_KEY && !API_FOOTBALL_KEY) {
@@ -871,6 +1000,7 @@ async function start() {
   const adminReady = initAdmin();
   scheduleAutoRefresh();
   scheduleResultFetching();
+  schedulePayouts(); // 🔥 NEW
 
   if (adminReady) {
     setTimeout(runAutomation, 5000);
