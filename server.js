@@ -657,7 +657,6 @@ async function sendPayouts() {
       return;
     }
     const TOKEN_PROGRAM_ID = mintInfo.owner;
-    const CLASSIC_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
     const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
     
     console.log('Token program:', TOKEN_PROGRAM_ID.toString());
@@ -699,86 +698,52 @@ async function sendPayouts() {
         
         const winnerKey = new PublicKey(payout.user_address);
         
-        // 🔥 SEARCH for existing Classic SPL MONKE account
+        // 🔥 SIMPLE: Find ANY MONKE account for this user, pick highest balance
         let winnerATA = null;
         let needCreateATA = false;
         
-        console.log('=== SEARCHING TOKEN ACCOUNTS ===');
-        console.log('Winner:', winnerKey.toString());
+        const allAccounts = await connection.getTokenAccountsByOwner(
+          winnerKey,
+          { mint: tokenMint }
+        );
         
-        // Search Classic SPL accounts
-        try {
-          const classicAccounts = await connection.getTokenAccountsByOwner(
-            winnerKey,
-            { programId: CLASSIC_TOKEN_PROGRAM }
-          );
-          console.log('Classic SPL accounts found:', classicAccounts.value.length);
-          
-          for (const acc of classicAccounts.value) {
+        console.log(`Found ${allAccounts.value.length} MONKE accounts for winner`);
+        
+        if (allAccounts.value.length > 0) {
+          // Pick the one with highest balance (user's main wallet)
+          let highestBalance = 0;
+          for (const acc of allAccounts.value) {
             try {
-              const accInfo = await connection.getParsedAccountInfo(acc.pubkey);
-              const accMint = accInfo.value?.data?.parsed?.info?.mint;
-              console.log(`  Checking: ${acc.pubkey.toString()} mint=${accMint}`);
-              if (accMint === TOKEN_MINT) {
+              const bal = await connection.getTokenAccountBalance(acc.pubkey);
+              const uiAmount = bal.value.uiAmount || 0;
+              console.log(`  ${acc.pubkey.toString().slice(0,8)}... = ${uiAmount} MONKE`);
+              if (uiAmount > highestBalance) {
+                highestBalance = uiAmount;
                 winnerATA = acc.pubkey;
-                const bal = await connection.getTokenAccountBalance(acc.pubkey);
-                console.log('✅ Found Classic SPL MONKE:', winnerATA.toString(), `(${bal.value.uiAmount} MONKE)`);
-                break;
               }
             } catch(e) {
-              console.log(`  Error parsing ${acc.pubkey.toString()}:`, e.message);
+              console.log(`  Skipping ${acc.pubkey.toString().slice(0,8)}... - ${e.message}`);
             }
           }
-        } catch(e) {
-          console.log('Classic SPL search error:', e.message);
+          console.log(`✅ Selected: ${winnerATA.toString().slice(0,8)}... (${highestBalance} MONKE)`);
         }
         
-        // Fallback: Search Token-2022 accounts
         if (!winnerATA) {
-          try {
-            const t22Accounts = await connection.getTokenAccountsByOwner(
-              winnerKey,
-              { programId: TOKEN_PROGRAM_ID }
-            );
-            console.log('Token-2022 accounts found:', t22Accounts.value.length);
-            
-            for (const acc of t22Accounts.value) {
-              try {
-                const accInfo = await connection.getParsedAccountInfo(acc.pubkey);
-                const accMint = accInfo.value?.data?.parsed?.info?.mint;
-                if (accMint === TOKEN_MINT) {
-                  winnerATA = acc.pubkey;
-                  console.log('⚠️ Using Token-2022 MONKE:', winnerATA.toString());
-                  break;
-                }
-              } catch(e) {}
-            }
-          } catch(e) {
-            console.log('Token-2022 search error:', e.message);
-          }
-        }
-        
-        // Last resort: Derive Classic SPL ATA
-        if (!winnerATA) {
+          // No account exists - create one
           [winnerATA] = PublicKey.findProgramAddressSync(
-            [winnerKey.toBuffer(), CLASSIC_TOKEN_PROGRAM.toBuffer(), tokenMint.toBuffer()],
+            [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
             ASSOCIATED_TOKEN_PROGRAM_ID
           );
           needCreateATA = true;
-          console.log('📝 No MONKE account found. Creating Classic SPL:', winnerATA.toString());
+          console.log('📝 Creating new ATA:', winnerATA.toString().slice(0,8) + '...');
         }
-        
-        console.log('=== SEARCH COMPLETE ===');
-        console.log('Selected ATA:', winnerATA.toString());
-        console.log('Need create:', needCreateATA);
         
         const amountRaw = Math.floor(amount * 1e6);
         
-        console.log(`📤 Sending ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
+        console.log(`📤 Sending ${amount.toFixed(2)} MONKE to ${payout.user_address.slice(0,8)}...`);
         
         const tx = new Transaction();
         
-        // Create ATA if needed
         if (needCreateATA) {
           tx.add(new TransactionInstruction({
             keys: [
@@ -787,7 +752,7 @@ async function sendPayouts() {
               { pubkey: winnerKey, isSigner: false, isWritable: false },
               { pubkey: tokenMint, isSigner: false, isWritable: false },
               { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-              { pubkey: CLASSIC_TOKEN_PROGRAM, isSigner: false, isWritable: false },
+              { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
               { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
             ],
             programId: ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -795,7 +760,6 @@ async function sendPayouts() {
           }));
         }
         
-        // Build transfer instruction
         const keys = [
           { pubkey: adminATA, isSigner: false, isWritable: true },
           { pubkey: winnerATA, isSigner: false, isWritable: true },
