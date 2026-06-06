@@ -1212,7 +1212,7 @@ function schedulePayouts() {
     } catch (e) {
       console.error('Payout cycle error:', e.message);
     }
-  }, 5 * 60 * 1000);
+  }, 1 * 60 * 1000);
   console.log('💰 Payout processing scheduled every 5 minutes');
 }
 
