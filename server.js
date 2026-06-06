@@ -527,7 +527,6 @@ async function processPayouts() {
   console.log('💰 Processing payouts...');
   
   try {
-    // Get settled matches that haven't been processed
     const settledMatches = await query(
       `SELECT m.* FROM matches m 
        WHERE m.status = 'FINISHED' 
@@ -542,7 +541,6 @@ async function processPayouts() {
     
     for (const match of settledMatches.rows) {
       try {
-        // Get winning bets for this match (checking payout status instead of claimed)
         const winningBets = await query(
           `SELECT b.* FROM bets b 
            WHERE b.match_id = $1 
@@ -553,7 +551,6 @@ async function processPayouts() {
           [match.id, match.winner]
         );
         
-        // Get total pool
         const totalPoolResult = await query(
           "SELECT COALESCE(SUM(CAST(amount AS DECIMAL)), 0) as total FROM bets WHERE match_id = $1",
           [match.id]
@@ -565,21 +562,17 @@ async function processPayouts() {
           continue;
         }
         
-        // Calculate fees
         const platformFee = totalPool * (PLATFORM_FEE_BPS / 10000);
         const prizePool = totalPool - platformFee;
         
-        // Record platform fee
         await query(
           "INSERT INTO platform_fees (match_id, amount) VALUES ($1, $2)",
           [match.id, platformFee.toFixed(2)]
         );
         
-        // Calculate winning pool total
         const winningPoolTotal = winningBets.rows.reduce((sum, b) => sum + parseFloat(b.amount), 0);
         
         if (winningPoolTotal === 0) {
-          // No winners - refund all bets for this match
           const allBets = await query(
             `SELECT b.* FROM bets b 
              WHERE b.match_id = $1 
@@ -590,30 +583,37 @@ async function processPayouts() {
           );
           
           for (const bet of allBets.rows) {
-            await query(
-              "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'refund')",
-              [bet.id, bet.user_address, match.id, bet.amount]
-            );
-            // 🔥 Don't mark claimed - sendPayouts will do it after transfer
+            // 🔥 Validate address before inserting
+            try {
+              new PublicKey(bet.user_address);
+              await query(
+                "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'refund')",
+                [bet.id, bet.user_address, match.id, bet.amount]
+              );
+            } catch(e) {
+              console.error(`❌ Invalid address in bet #${bet.id}: ${bet.user_address}`);
+            }
           }
           console.log(`Match ${match.id}: Refunded all bets (no winners)`);
         } else {
-          // Pay winners proportionally
           for (const bet of winningBets.rows) {
             const betAmount = parseFloat(bet.amount);
             const payout = (betAmount / winningPoolTotal) * prizePool;
             
-            await query(
-              "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'match')",
-              [bet.id, bet.user_address, match.id, payout.toFixed(2)]
-            );
-            // 🔥 Don't mark claimed - sendPayouts will do it after transfer
-            
-            console.log(`✅ ${bet.user_address.slice(0,8)}... wins ${payout.toFixed(2)} MONKE (Match ${match.id})`);
+            // 🔥 Validate address before inserting
+            try {
+              new PublicKey(bet.user_address);
+              await query(
+                "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'match')",
+                [bet.id, bet.user_address, match.id, payout.toFixed(2)]
+              );
+              console.log(`✅ ${bet.user_address.slice(0,8)}... wins ${payout.toFixed(2)} MONKE (Match ${match.id})`);
+            } catch(e) {
+              console.error(`❌ Invalid address in bet #${bet.id}: ${bet.user_address} - SKIPPING`);
+            }
           }
         }
         
-        // Mark match as processed
         await query(
           "INSERT INTO payouts (match_id, amount, type, user_address) VALUES ($1, $2, 'fee', 'platform')",
           [match.id, platformFee.toFixed(2)]
@@ -630,7 +630,6 @@ async function processPayouts() {
     console.error('❌ Payout error:', e.message);
   }
 }
-
 // ═══════════════════════════════════════════════════════════════
 //  AUTO-PAYOUT - Runs on Heroku (No PC needed!)
 // ═══════════════════════════════════════════════════════════════
