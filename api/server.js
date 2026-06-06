@@ -619,12 +619,103 @@ async function processPayouts() {
   }
 }
 
+
 async function runAutomation() {
   console.log('🤖 Running MONKE BET automation...');
   try { await processPayouts(); } catch (e) { console.error('❌ Payout error:', e.message); }
   console.log('✅ Automation complete');
 }
+// ═══════════════════════════════════════════════════════════════
+//  AUTO-PAYOUT - Runs on Heroku (No PC needed!)
+// ═══════════════════════════════════════════════════════════════
 
+const { Connection, Keypair, PublicKey, Transaction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { getAssociatedTokenAddress, createTransferInstruction, TOKEN_PROGRAM_ID } = require('@solana/spl-token');
+const bs58 = require('bs58');
+
+async function sendPayouts() {
+  console.log('💰 Sending payouts...');
+  
+  if (!ADMIN_PRIVATE_KEY || ADMIN_PRIVATE_KEY === 'your_admin_private_key (optional)') {
+    console.log('⚠️ Admin key not set - skipping payouts');
+    return;
+  }
+  
+  try {
+    const connection = new Connection(RPC_URL, 'confirmed');
+    const tokenMint = new PublicKey(TOKEN_MINT);
+    
+    // Load admin wallet
+    const secretKey = bs58.decode(ADMIN_PRIVATE_KEY);
+    const adminKeypair = Keypair.fromSecretKey(secretKey);
+    const adminATA = await getAssociatedTokenAddress(tokenMint, adminKeypair.publicKey);
+    
+    // Get unpaid payouts
+    const unpaidPayouts = await query(
+      `SELECT * FROM payouts 
+       WHERE tx_hash IS NULL 
+       AND type IN ('match', 'refund')
+       ORDER BY id ASC
+       LIMIT 50`
+    );
+    
+    if (unpaidPayouts.rows.length === 0) return;
+    
+    console.log(`📊 Sending ${unpaidPayouts.rows.length} payouts...`);
+    
+    let sent = 0;
+    
+    for (const payout of unpaidPayouts.rows) {
+      try {
+        const amount = parseFloat(payout.amount);
+        if (amount <= 0) continue;
+        
+        const winnerKey = new PublicKey(payout.user_address);
+        const winnerATA = await getAssociatedTokenAddress(tokenMint, winnerKey);
+        const amountRaw = Math.floor(amount * 1e6);
+        
+        const transferIx = createTransferInstruction(
+          adminATA, winnerATA, adminKeypair.publicKey, amountRaw
+        );
+        
+        const tx = new Transaction().add(transferIx);
+        const { blockhash } = await connection.getLatestBlockhash();
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = adminKeypair.publicKey;
+        
+        const signature = await sendAndConfirmTransaction(connection, tx, [adminKeypair]);
+        
+        await query("UPDATE payouts SET tx_hash = $1 WHERE id = $2", [signature, payout.id]);
+        
+        console.log(`✅ Sent ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
+        sent++;
+        
+        await new Promise(r => setTimeout(r, 500));
+        
+      } catch(e) {
+        console.error(`❌ Payout #${payout.id}: ${e.message}`);
+      }
+    }
+    
+    console.log(`✅ Sent ${sent} payouts`);
+    
+  } catch(e) {
+    console.error('❌ Payout error:', e.message);
+  }
+}
+
+// 🔥 COMBINED: Calculate + Send in one function
+async function processAndSendPayouts() {
+  await processPayouts();  // Calculate payouts
+  await sendPayouts();     // Send tokens immediately
+}
+
+// Update runAutomation
+async function runAutomation() {
+  console.log('🤖 Running MONKE BET automation...');
+  try { await processAndSendPayouts(); } catch (e) { console.error('❌ Error:', e.message); }
+  console.log('✅ Automation complete');
+}
 // ════════════════════════════════════════════════════════════════════════
 //  ROUTES
 // ════════════════════════════════════════════════════════════════════════
