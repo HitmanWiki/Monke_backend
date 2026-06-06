@@ -635,7 +635,7 @@ async function processPayouts() {
 //  AUTO-PAYOUT - Runs on Heroku (No PC needed!)
 // ═══════════════════════════════════════════════════════════════
 
-const { Connection, Keypair, PublicKey, Transaction, TransactionInstruction, sendAndConfirmTransaction } = require('@solana/web3.js');
+const { Connection, Keypair, PublicKey, Transaction, TransactionInstruction, SystemProgram, SYSVAR_RENT_PUBKEY, sendAndConfirmTransaction } = require('@solana/web3.js');
 const { getAssociatedTokenAddress, createTransferInstruction, TOKEN_PROGRAM_ID } = require('@solana/spl-token');
 const bs58 = require('bs58');
 
@@ -644,7 +644,6 @@ async function sendPayouts() {
   
   if (!ADMIN_PRIVATE_KEY || ADMIN_PRIVATE_KEY === 'your_admin_private_key (optional)') {
     console.log('⚠️ Admin key not set - skipping payouts');
-    console.log('ADMIN_PRIVATE_KEY exists:', !!ADMIN_PRIVATE_KEY);
     return;
   }
   
@@ -652,47 +651,44 @@ async function sendPayouts() {
     console.log('Connecting to RPC:', RPC_URL);
     const connection = new Connection(RPC_URL, 'confirmed');
     const tokenMint = new PublicKey(TOKEN_MINT);
-    console.log('Token mint:', TOKEN_MINT);
     
-    // Auto-detect token program
     const mintInfo = await connection.getAccountInfo(tokenMint);
     if (!mintInfo) {
       console.error('❌ Could not find token mint account!');
       return;
     }
     const TOKEN_PROGRAM_ID = mintInfo.owner;
+    const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+    
     console.log('Token program:', TOKEN_PROGRAM_ID.toString());
     
-    // Load admin wallet
     const secretKey = bs58.decode(ADMIN_PRIVATE_KEY);
     const adminKeypair = Keypair.fromSecretKey(secretKey);
     console.log('Admin wallet:', adminKeypair.publicKey.toString());
     
-    // Get admin ATA
-    const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
     const [adminATA] = PublicKey.findProgramAddressSync(
       [adminKeypair.publicKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
       ASSOCIATED_TOKEN_PROGRAM_ID
     );
-    console.log('Admin ATA:', adminATA.toString());
     
-    // Check admin balance
     try {
       const balance = await connection.getTokenAccountBalance(adminATA);
       console.log('💰 Admin balance:', balance.value.uiAmount, 'MONKE');
     } catch(e) {
-      console.error('❌ Admin ATA not found or no balance:', e.message);
-      return; // 🔥 STOP if admin has no tokens
+      console.error('❌ Admin ATA not found:', e.message);
+      return;
     }
     
-    // Get unpaid payouts
     const unpaidPayouts = await query(
       `SELECT * FROM payouts WHERE tx_hash IS NULL AND type IN ('match', 'refund') ORDER BY id ASC LIMIT 50`
     );
     
-    console.log(`📊 Found ${unpaidPayouts.rows.length} unpaid payouts`);
+    if (unpaidPayouts.rows.length === 0) {
+      console.log('No unpaid payouts');
+      return;
+    }
     
-    if (unpaidPayouts.rows.length === 0) return;
+    console.log(`📊 Found ${unpaidPayouts.rows.length} unpaid payouts`);
     
     let sent = 0;
     
@@ -700,8 +696,6 @@ async function sendPayouts() {
       try {
         const amount = parseFloat(payout.amount);
         if (amount <= 0 || isNaN(amount)) continue;
-        
-        console.log(`📤 Sending ${amount.toFixed(2)} MONKE to ${payout.user_address.slice(0,8)}...`);
         
         const winnerKey = new PublicKey(payout.user_address);
         const [winnerATA] = PublicKey.findProgramAddressSync(
@@ -711,6 +705,30 @@ async function sendPayouts() {
         
         const amountRaw = Math.floor(amount * 1e6);
         
+        console.log(`📤 Sending ${amount.toFixed(2)} MONKE to ${payout.user_address.slice(0,8)}...`);
+        
+        const tx = new Transaction();
+        
+        // 🔥 Check if winner ATA exists, create if not
+        const winnerATAInfo = await connection.getAccountInfo(winnerATA);
+        if (!winnerATAInfo) {
+          console.log('📝 Creating winner token account...');
+          tx.add(new TransactionInstruction({
+            keys: [
+              { pubkey: adminKeypair.publicKey, isSigner: true, isWritable: true },
+              { pubkey: winnerATA, isSigner: false, isWritable: true },
+              { pubkey: winnerKey, isSigner: false, isWritable: false },
+              { pubkey: tokenMint, isSigner: false, isWritable: false },
+              { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+              { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+              { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+            ],
+            programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+            data: Buffer.alloc(0)
+          }));
+        }
+        
+        // Build transfer instruction
         const keys = [
           { pubkey: adminATA, isSigner: false, isWritable: true },
           { pubkey: winnerATA, isSigner: false, isWritable: true },
@@ -721,8 +739,8 @@ async function sendPayouts() {
         data[0] = 3;
         data.writeBigUInt64LE(BigInt(amountRaw), 1);
         
-        const transferIx = new TransactionInstruction({ keys, programId: TOKEN_PROGRAM_ID, data });
-        const tx = new Transaction().add(transferIx);
+        tx.add(new TransactionInstruction({ keys, programId: TOKEN_PROGRAM_ID, data }));
+        
         const { blockhash } = await connection.getLatestBlockhash();
         tx.recentBlockhash = blockhash;
         tx.feePayer = adminKeypair.publicKey;
@@ -741,7 +759,6 @@ async function sendPayouts() {
         
       } catch(e) {
         console.error(`❌ Payout #${payout.id} FAILED:`, e.message);
-        if (e.stack) console.error('Stack:', e.stack.split('\n')[0]);
       }
     }
     
