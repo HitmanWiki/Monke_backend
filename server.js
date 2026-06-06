@@ -22,7 +22,7 @@ const FOOTBALL_DATA_KEY   = process.env.FOOTBALL_DATA_API_KEY;
 const API_FOOTBALL_KEY    = process.env.API_FOOTBALL_KEY;
 const ADMIN_PRIVATE_KEY   = process.env.ADMIN_PRIVATE_KEY || '';
 const TOKEN_MINT          = process.env.TOKEN_MINT || '';
-const ESCROW_WALLET       = process.env.ADMIN_PRIVATE_KEY ? '5cVWDSpcF6WWo6jLNwVmczNtCjWer5BiWp1VgRjzQhdY' : '';
+const ESCROW_WALLET       = process.env.ADMIN_PRIVATE_KEY ? '74BoTqMbXNeaef63wLzKmRyn5S1NxKTdZsJznGAnMFSL' : '';
 const PLATFORM_FEE_BPS    = 300; // 3% platform fee
 const RPC_URL             = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
 
@@ -999,6 +999,24 @@ app.post("/api/ultimate/update-deadline", async (req, res) => {
       [deadline]
     );
     res.json({ success: true, deadline: deadline });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+// Update team names
+app.put("/api/matches/:id/teams", async (req, res) => {
+  const { homeTeam, awayTeam } = req.body;
+  const matchId = parseInt(req.params.id);
+  
+  if (isNaN(matchId)) return res.status(400).json({ error: "Invalid match ID" });
+  if (!homeTeam || !awayTeam) return res.status(400).json({ error: "homeTeam and awayTeam required" });
+  
+  try {
+    await query(
+      "UPDATE matches SET home_team = $1, away_team = $2, last_updated = CURRENT_TIMESTAMP WHERE id = $3",
+      [homeTeam, awayTeam, matchId]
+    );
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
