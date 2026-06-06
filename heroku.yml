@@ -1,0 +1,5 @@
+@"
+build:
+  docker:
+    web: Dockerfile
+"@ | Out-File -FilePath heroku.yml -Encoding utf8
