@@ -657,6 +657,8 @@ async function sendPayouts() {
       return;
     }
     const TOKEN_PROGRAM_ID = mintInfo.owner;
+    const CLASSIC_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+    const TOKEN_2022_PROGRAM = new PublicKey('TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb');
     const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
     
     console.log('Token program:', TOKEN_PROGRAM_ID.toString());
@@ -699,45 +701,68 @@ async function sendPayouts() {
         
         const winnerKey = new PublicKey(payout.user_address);
         
-        // 🔥 FIND EXISTING TOKEN ACCOUNT FIRST (any program)
+        // 🔥 FIND EXISTING TOKEN ACCOUNTS
         const existingAccounts = await connection.getTokenAccountsByOwner(
           winnerKey,
           { mint: tokenMint }
         );
         
-        let winnerATA;
+        let winnerATA = null;
         let needCreateATA = false;
+        let useTokenProgram = TOKEN_PROGRAM_ID; // Default
         
         if (existingAccounts.value.length > 0) {
-          // Use the existing account (Phantom-compatible)
-          winnerATA = existingAccounts.value[0].pubkey;
-          console.log(`✅ Using existing token account: ${winnerATA.toString()}`);
-        } else {
-          // No account exists - derive ATA
+          // 🔥 PREFER CLASSIC SPL OVER TOKEN-2022
+          console.log(`Found ${existingAccounts.value.length} existing token accounts`);
+          
+          for (const acc of existingAccounts.value) {
+            const accInfo = await connection.getAccountInfo(acc.pubkey);
+            if (accInfo && accInfo.owner.equals(CLASSIC_TOKEN_PROGRAM)) {
+              winnerATA = acc.pubkey;
+              useTokenProgram = CLASSIC_TOKEN_PROGRAM;
+              console.log('✅ Selected Classic SPL account:', winnerATA.toString());
+              break;
+            }
+          }
+          
+          // Fallback: Use Token-2022 if no Classic SPL found
+          if (!winnerATA) {
+            winnerATA = existingAccounts.value[0].pubkey;
+            const accInfo = await connection.getAccountInfo(winnerATA);
+            useTokenProgram = accInfo ? accInfo.owner : TOKEN_PROGRAM_ID;
+            console.log('⚠️ Fallback to existing account:', winnerATA.toString());
+          }
+        }
+        
+        // No account exists - create Classic SPL ATA
+        if (!winnerATA) {
           [winnerATA] = PublicKey.findProgramAddressSync(
-            [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+            [winnerKey.toBuffer(), CLASSIC_TOKEN_PROGRAM.toBuffer(), tokenMint.toBuffer()],
             ASSOCIATED_TOKEN_PROGRAM_ID
           );
+          useTokenProgram = CLASSIC_TOKEN_PROGRAM;
           needCreateATA = true;
-          console.log(`📝 Creating new token account: ${winnerATA.toString()}`);
+          console.log('📝 Creating Classic SPL account:', winnerATA.toString());
         }
         
         const amountRaw = Math.floor(amount * 1e6);
         
         console.log(`📤 Sending ${amount.toFixed(2)} MONKE to ${payout.user_address.slice(0,8)}...`);
+        console.log(`   Using ATA: ${winnerATA.toString()}`);
+        console.log(`   Token Program: ${useTokenProgram.toString()}`);
         
         const tx = new Transaction();
         
-        // Create ATA only if user doesn't have any MONKE account
+        // Create ATA only if needed
         if (needCreateATA) {
           tx.add(new TransactionInstruction({
             keys: [
               { pubkey: adminKeypair.publicKey, isSigner: true, isWritable: true },
               { pubkey: winnerATA, isSigner: false, isWritable: true },
-              { pubkey: winnerKey, isSigner: false, isWritable: false }, // 🔥 OWNER = WINNER
+              { pubkey: winnerKey, isSigner: false, isWritable: false },
               { pubkey: tokenMint, isSigner: false, isWritable: false },
               { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-              { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+              { pubkey: CLASSIC_TOKEN_PROGRAM, isSigner: false, isWritable: false },
               { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
             ],
             programId: ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -756,7 +781,7 @@ async function sendPayouts() {
         data[0] = 3;
         data.writeBigUInt64LE(BigInt(amountRaw), 1);
         
-        tx.add(new TransactionInstruction({ keys, programId: TOKEN_PROGRAM_ID, data }));
+        tx.add(new TransactionInstruction({ keys, programId: useTokenProgram, data }));
         
         const { blockhash } = await connection.getLatestBlockhash();
         tx.recentBlockhash = blockhash;
