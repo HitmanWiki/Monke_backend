@@ -521,7 +521,7 @@ function formatMatch(row) {
   };
 }
 
-const PLATFORM_FEE_BPS = 300; // 3% platform fee
+
 
 async function processPayouts() {
   console.log('💰 Processing payouts...');
