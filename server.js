@@ -651,13 +651,14 @@ async function sendPayouts() {
     const connection = new Connection(RPC_URL, 'confirmed');
     const tokenMint = new PublicKey(TOKEN_MINT);
     
-    // 🔥 Auto-detect token program (same as placeBet)
+    // 🔥 Auto-detect token program
     const mintInfo = await connection.getAccountInfo(tokenMint);
     if (!mintInfo) {
       console.error('❌ Could not find token mint account!');
       return;
     }
     const TOKEN_PROGRAM_ID = mintInfo.owner;
+    const CLASSIC_TOKEN_PROGRAM = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
     const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
     
     console.log('Token program:', TOKEN_PROGRAM_ID.toString());
@@ -667,7 +668,7 @@ async function sendPayouts() {
     const adminKeypair = Keypair.fromSecretKey(secretKey);
     console.log('Admin wallet:', adminKeypair.publicKey.toString());
     
-    // 🔥 Derive admin ATA using auto-detected program (same as placeBet)
+    // Get admin ATA using detected token program
     const [adminATA] = PublicKey.findProgramAddressSync(
       [adminKeypair.publicKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
       ASSOCIATED_TOKEN_PROGRAM_ID
@@ -701,23 +702,40 @@ async function sendPayouts() {
         
         const winnerKey = new PublicKey(payout.user_address);
         
-        // 🔥 Derive winner ATA using auto-detected program (same as placeBet)
-        const [winnerATA] = PublicKey.findProgramAddressSync(
-          [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+        // 🔥 FIRST: Check if Classic SPL ATA exists (Phantom-compatible)
+        const [classicATA] = PublicKey.findProgramAddressSync(
+          [winnerKey.toBuffer(), CLASSIC_TOKEN_PROGRAM.toBuffer(), tokenMint.toBuffer()],
           ASSOCIATED_TOKEN_PROGRAM_ID
         );
         
-        console.log(`📤 Sending ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
-        console.log(`   Winner ATA: ${winnerATA.toString()}`);
+        const classicATAInfo = await connection.getAccountInfo(classicATA);
+        let winnerATA;
+        let useTokenProgram = TOKEN_PROGRAM_ID;
+        
+        if (classicATAInfo && classicATAInfo.data.length > 0) {
+          // ✅ Classic SPL account exists - use it!
+          winnerATA = classicATA;
+          console.log('✅ Using Classic SPL ATA:', winnerATA.toString());
+        } else {
+          // Fallback to Token-2022 ATA
+          [winnerATA] = PublicKey.findProgramAddressSync(
+            [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          );
+          console.log('⚠️ Using Token-2022 ATA:', winnerATA.toString());
+        }
         
         const amountRaw = Math.floor(amount * 1e6);
         
+        console.log(`📤 Sending ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
+        
         const tx = new Transaction();
         
-        // 🔥 Check if winner ATA exists, create if needed (same as placeBet)
+        // Check if winner ATA exists, create if needed
         const winnerATAInfo = await connection.getAccountInfo(winnerATA);
         if (!winnerATAInfo) {
-          console.log('📝 Creating winner token account...');
+          console.log('📝 Creating token account...');
+          const createProgram = winnerATA.equals(classicATA) ? CLASSIC_TOKEN_PROGRAM : TOKEN_PROGRAM_ID;
           tx.add(new TransactionInstruction({
             keys: [
               { pubkey: adminKeypair.publicKey, isSigner: true, isWritable: true },
@@ -725,7 +743,7 @@ async function sendPayouts() {
               { pubkey: winnerKey, isSigner: false, isWritable: false },
               { pubkey: tokenMint, isSigner: false, isWritable: false },
               { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-              { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+              { pubkey: createProgram, isSigner: false, isWritable: false },
               { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
             ],
             programId: ASSOCIATED_TOKEN_PROGRAM_ID,
@@ -733,7 +751,7 @@ async function sendPayouts() {
           }));
         }
         
-        // 🔥 Build transfer with auto-detected program (same as placeBet)
+        // Build transfer instruction
         const keys = [
           { pubkey: adminATA, isSigner: false, isWritable: true },
           { pubkey: winnerATA, isSigner: false, isWritable: true },
