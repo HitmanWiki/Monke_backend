@@ -1174,10 +1174,18 @@ function scheduleAutoRefresh() {
   }, 6 * 60 * 60 * 1000);
   console.log("⏰ Auto-refresh scheduled every 6 hours");
 }
-// 🔥 NEW - Payout scheduling
 function schedulePayouts() {
-  setInterval(processPayouts, 5 * 60 * 1000);
-  console.log("💰 Payout processing scheduled every 5 minutes");
+  setInterval(async () => {
+    try {
+      console.log('⏰ Payout cycle starting...');
+      await processPayouts();  // Calculate
+      await sendPayouts();     // 🔥 Send tokens - MAKE SURE THIS IS HERE
+      console.log('✅ Payout cycle complete');
+    } catch (e) {
+      console.error('Payout cycle error:', e.message);
+    }
+  }, 5 * 60 * 1000);
+  console.log('💰 Payout processing scheduled every 5 minutes');
 }
 
 function scheduleResultFetching() {
