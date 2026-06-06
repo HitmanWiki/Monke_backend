@@ -1095,7 +1095,7 @@ async function start() {
   console.log(`🤖 AI: ${GEMINI_API_KEY ? '✅ Google Gemini' : '❌ Missing'}`);
   console.log(`📊 Results: ${FOOTBALL_DATA_KEY ? '✅ football-data.org' : (API_FOOTBALL_KEY ? '✅ api-football' : '⚠️ Manual')}`);
   console.log(`🗄️  DB: ${DATABASE_URL ? '✅ Neon PostgreSQL' : '❌ Missing'}`);
-  console.log(`🔗 Solana Program: ${PROGRAM_ID ? '✅ Configured' : '⚠️ Not set'}`);
+  console.log(`💰 Escrow System: ✅ Active`);
   console.log(`🪙 Token Mint: ${TOKEN_MINT ? '✅ Configured' : '⚠️ Not set'}`);
   console.log("=".repeat(55));
 
