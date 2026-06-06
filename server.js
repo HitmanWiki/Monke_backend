@@ -601,9 +601,9 @@ async function processPayouts() {
           }
         }
         
-        // Mark match as processed
+        // 🔥 FIXED: Mark match as processed (added user_address)
         await query(
-          "INSERT INTO payouts (match_id, amount, type) VALUES ($1, $2, 'fee')",
+          "INSERT INTO payouts (match_id, amount, type, user_address) VALUES ($1, $2, 'fee', 'platform')",
           [match.id, platformFee.toFixed(2)]
         );
         
@@ -620,11 +620,6 @@ async function processPayouts() {
 }
 
 
-async function runAutomation() {
-  console.log('🤖 Running MONKE BET automation...');
-  try { await processPayouts(); } catch (e) { console.error('❌ Payout error:', e.message); }
-  console.log('✅ Automation complete');
-}
 // ═══════════════════════════════════════════════════════════════
 //  AUTO-PAYOUT - Runs on Heroku (No PC needed!)
 // ═══════════════════════════════════════════════════════════════
@@ -1132,10 +1127,10 @@ async function start() {
   schedulePayouts(); // 🔥 NEW
 
   if (adminReady) {
-    setTimeout(runAutomation, 5000);
-    setInterval(runAutomation, 5 * 60 * 1000);
-    console.log("⏰ Solana automation scheduled every 5 minutes");
-  }
+  // Run once at startup
+  setTimeout(processAndSendPayouts, 10000);
+  console.log("💰 Auto-payouts scheduled every 5 minutes");
+}
 
   const PORT = process.env.PORT || 3001;
   app.listen(PORT, () => {
