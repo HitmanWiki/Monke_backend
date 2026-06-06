@@ -542,9 +542,14 @@ async function processPayouts() {
     
     for (const match of settledMatches.rows) {
       try {
-        // Get winning bets for this match
+        // Get winning bets for this match (checking payout status instead of claimed)
         const winningBets = await query(
-          "SELECT * FROM bets WHERE match_id = $1 AND prediction = $2 AND claimed = false",
+          `SELECT b.* FROM bets b 
+           WHERE b.match_id = $1 
+           AND b.prediction = $2 
+           AND NOT EXISTS (
+             SELECT 1 FROM payouts p WHERE p.bet_id = b.id AND p.tx_hash IS NOT NULL
+           )`,
           [match.id, match.winner]
         );
         
@@ -574,14 +579,22 @@ async function processPayouts() {
         const winningPoolTotal = winningBets.rows.reduce((sum, b) => sum + parseFloat(b.amount), 0);
         
         if (winningPoolTotal === 0) {
-          // No winners - refund all
-          const allBets = await query("SELECT * FROM bets WHERE match_id = $1 AND claimed = false", [match.id]);
+          // No winners - refund all bets for this match
+          const allBets = await query(
+            `SELECT b.* FROM bets b 
+             WHERE b.match_id = $1 
+             AND NOT EXISTS (
+               SELECT 1 FROM payouts p WHERE p.bet_id = b.id AND p.tx_hash IS NOT NULL
+             )`,
+            [match.id]
+          );
+          
           for (const bet of allBets.rows) {
             await query(
               "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'refund')",
               [bet.id, bet.user_address, match.id, bet.amount]
             );
-            await query("UPDATE bets SET claimed = true WHERE id = $1", [bet.id]);
+            // 🔥 Don't mark claimed - sendPayouts will do it after transfer
           }
           console.log(`Match ${match.id}: Refunded all bets (no winners)`);
         } else {
@@ -594,14 +607,13 @@ async function processPayouts() {
               "INSERT INTO payouts (bet_id, user_address, match_id, amount, type) VALUES ($1, $2, $3, $4, 'match')",
               [bet.id, bet.user_address, match.id, payout.toFixed(2)]
             );
-            
-            await query("UPDATE bets SET claimed = true WHERE id = $1", [bet.id]);
+            // 🔥 Don't mark claimed - sendPayouts will do it after transfer
             
             console.log(`✅ ${bet.user_address.slice(0,8)}... wins ${payout.toFixed(2)} MONKE (Match ${match.id})`);
           }
         }
         
-        // 🔥 FIXED: Mark match as processed (added user_address)
+        // Mark match as processed
         await query(
           "INSERT INTO payouts (match_id, amount, type, user_address) VALUES ($1, $2, 'fee', 'platform')",
           [match.id, platformFee.toFixed(2)]
@@ -618,7 +630,6 @@ async function processPayouts() {
     console.error('❌ Payout error:', e.message);
   }
 }
-
 
 // ═══════════════════════════════════════════════════════════════
 //  AUTO-PAYOUT - Runs on Heroku (No PC needed!)
@@ -640,10 +651,30 @@ async function sendPayouts() {
     const connection = new Connection(RPC_URL, 'confirmed');
     const tokenMint = new PublicKey(TOKEN_MINT);
     
+    // 🔥 Auto-detect token program (Token-2022 for MONKE)
+    const mintInfo = await connection.getAccountInfo(tokenMint);
+    const TOKEN_PROGRAM_ID = mintInfo.owner;
+    const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+    
+    console.log('Token program:', TOKEN_PROGRAM_ID.toString());
+    
     // Load admin wallet
     const secretKey = bs58.decode(ADMIN_PRIVATE_KEY);
     const adminKeypair = Keypair.fromSecretKey(secretKey);
-    const adminATA = await getAssociatedTokenAddress(tokenMint, adminKeypair.publicKey);
+    
+    // Get admin ATA using correct token program
+    const [adminATA] = PublicKey.findProgramAddressSync(
+      [adminKeypair.publicKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+      ASSOCIATED_TOKEN_PROGRAM_ID
+    );
+    
+    // Check admin balance
+    try {
+      const balance = await connection.getTokenAccountBalance(adminATA);
+      console.log('💰 Admin balance:', balance.value.uiAmount, 'MONKE');
+    } catch(e) {
+      console.log('⚠️ Could not check admin balance');
+    }
     
     // Get unpaid payouts
     const unpaidPayouts = await query(
@@ -654,7 +685,10 @@ async function sendPayouts() {
        LIMIT 50`
     );
     
-    if (unpaidPayouts.rows.length === 0) return;
+    if (unpaidPayouts.rows.length === 0) {
+      console.log('No unpaid payouts');
+      return;
+    }
     
     console.log(`📊 Sending ${unpaidPayouts.rows.length} payouts...`);
     
@@ -663,36 +697,69 @@ async function sendPayouts() {
     for (const payout of unpaidPayouts.rows) {
       try {
         const amount = parseFloat(payout.amount);
-        if (amount <= 0) continue;
+        if (amount <= 0 || isNaN(amount)) {
+          console.log(`⏭️ Payout #${payout.id}: Invalid amount`);
+          continue;
+        }
         
         const winnerKey = new PublicKey(payout.user_address);
-        const winnerATA = await getAssociatedTokenAddress(tokenMint, winnerKey);
+        
+        // Get winner ATA using correct token program
+        const [winnerATA] = PublicKey.findProgramAddressSync(
+          [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+          ASSOCIATED_TOKEN_PROGRAM_ID
+        );
+        
         const amountRaw = Math.floor(amount * 1e6);
         
-        const transferIx = createTransferInstruction(
-          adminATA, winnerATA, adminKeypair.publicKey, amountRaw
-        );
+        // Build transfer instruction
+        const keys = [
+          { pubkey: adminATA, isSigner: false, isWritable: true },
+          { pubkey: winnerATA, isSigner: false, isWritable: true },
+          { pubkey: adminKeypair.publicKey, isSigner: true, isWritable: false },
+        ];
+        
+        const data = Buffer.alloc(9);
+        data[0] = 3; // Transfer instruction
+        data.writeBigUInt64LE(BigInt(amountRaw), 1);
+        
+        const transferIx = new TransactionInstruction({
+          keys,
+          programId: TOKEN_PROGRAM_ID,
+          data
+        });
         
         const tx = new Transaction().add(transferIx);
         const { blockhash } = await connection.getLatestBlockhash();
         tx.recentBlockhash = blockhash;
         tx.feePayer = adminKeypair.publicKey;
         
+        console.log(`📤 Sending ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
+        
         const signature = await sendAndConfirmTransaction(connection, tx, [adminKeypair]);
         
+        // 🔥 Mark payout as sent
         await query("UPDATE payouts SET tx_hash = $1 WHERE id = $2", [signature, payout.id]);
         
+        // 🔥 Mark bet as claimed
+        if (payout.bet_id) {
+          await query("UPDATE bets SET claimed = true WHERE id = $1", [payout.bet_id]);
+        }
+        
         console.log(`✅ Sent ${amount.toFixed(2)} MONKE → ${payout.user_address.slice(0,8)}...`);
+        console.log(`   TX: ${signature}`);
         sent++;
         
+        // Small delay between transactions
         await new Promise(r => setTimeout(r, 500));
         
       } catch(e) {
         console.error(`❌ Payout #${payout.id}: ${e.message}`);
+        if (e.logs) console.error('Logs:', e.logs);
       }
     }
     
-    console.log(`✅ Sent ${sent} payouts`);
+    console.log(`✅ Sent ${sent}/${unpaidPayouts.rows.length} payouts`);
     
   } catch(e) {
     console.error('❌ Payout error:', e.message);
