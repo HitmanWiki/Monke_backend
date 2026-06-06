@@ -648,7 +648,6 @@ async function sendPayouts() {
   }
   
   try {
-    console.log('Connecting to RPC:', RPC_URL);
     const connection = new Connection(RPC_URL, 'confirmed');
     const tokenMint = new PublicKey(TOKEN_MINT);
     
@@ -666,6 +665,7 @@ async function sendPayouts() {
     const adminKeypair = Keypair.fromSecretKey(secretKey);
     console.log('Admin wallet:', adminKeypair.publicKey.toString());
     
+    // Get admin ATA
     const [adminATA] = PublicKey.findProgramAddressSync(
       [adminKeypair.publicKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
       ASSOCIATED_TOKEN_PROGRAM_ID
@@ -698,10 +698,29 @@ async function sendPayouts() {
         if (amount <= 0 || isNaN(amount)) continue;
         
         const winnerKey = new PublicKey(payout.user_address);
-        const [winnerATA] = PublicKey.findProgramAddressSync(
-          [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
-          ASSOCIATED_TOKEN_PROGRAM_ID
+        
+        // 🔥 FIND EXISTING TOKEN ACCOUNT FIRST (any program)
+        const existingAccounts = await connection.getTokenAccountsByOwner(
+          winnerKey,
+          { mint: tokenMint }
         );
+        
+        let winnerATA;
+        let needCreateATA = false;
+        
+        if (existingAccounts.value.length > 0) {
+          // Use the existing account (Phantom-compatible)
+          winnerATA = existingAccounts.value[0].pubkey;
+          console.log(`✅ Using existing token account: ${winnerATA.toString()}`);
+        } else {
+          // No account exists - derive ATA
+          [winnerATA] = PublicKey.findProgramAddressSync(
+            [winnerKey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), tokenMint.toBuffer()],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          );
+          needCreateATA = true;
+          console.log(`📝 Creating new token account: ${winnerATA.toString()}`);
+        }
         
         const amountRaw = Math.floor(amount * 1e6);
         
@@ -709,15 +728,13 @@ async function sendPayouts() {
         
         const tx = new Transaction();
         
-        // 🔥 Check if winner ATA exists, create if not
-        const winnerATAInfo = await connection.getAccountInfo(winnerATA);
-        if (!winnerATAInfo) {
-          console.log('📝 Creating winner token account...');
+        // Create ATA only if user doesn't have any MONKE account
+        if (needCreateATA) {
           tx.add(new TransactionInstruction({
             keys: [
               { pubkey: adminKeypair.publicKey, isSigner: true, isWritable: true },
               { pubkey: winnerATA, isSigner: false, isWritable: true },
-              { pubkey: winnerKey, isSigner: false, isWritable: false },
+              { pubkey: winnerKey, isSigner: false, isWritable: false }, // 🔥 OWNER = WINNER
               { pubkey: tokenMint, isSigner: false, isWritable: false },
               { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
               { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
@@ -759,6 +776,7 @@ async function sendPayouts() {
         
       } catch(e) {
         console.error(`❌ Payout #${payout.id} FAILED:`, e.message);
+        if (e.logs) console.error('Logs:', e.logs);
       }
     }
     
